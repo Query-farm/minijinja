@@ -4,7 +4,7 @@
 
 namespace duckdb {
 
-class TeraExtension : public Extension {
+class MinijinjaExtension : public Extension {
 public:
 	void Load(ExtensionLoader &db) override;
 	std::string Name() override;

@@ -35,7 +35,7 @@ struct ResultCString {
 };
 
 /**
- * Renders a Tera template from a file or a string with context variables provided as JSON.
+ * Renders a Minijinja template from a file or a string with context variables provided as JSON.
  *
  * # Arguments
  * * `template_source` - Either the filename of the template or the template content as a string.
@@ -43,11 +43,12 @@ struct ResultCString {
  * * `json_context` - JSON string containing context variables.
  *
  * # Returns
- * * `Ok(String)` containing the rendered template, or `Err(tera::Error)` if rendering fails.
+ * * `Ok(String)` containing the rendered template, or `Err(minijinja::Error)` if rendering fails.
  */
 struct ResultCString render_template(const char *template_source, uintptr_t template_source_len,
                                      const char *json_context, uintptr_t json_context_len, const char *template_path,
-                                     bool autoscape, const char **autoescape_on, size_t autoescape_on_count);
+                                     bool autoscape, const char *undefined_behavior, const char **autoescape_on,
+                                     size_t autoescape_on_count);
 
 /**
  * Frees the memory allocated for a ResultCString.

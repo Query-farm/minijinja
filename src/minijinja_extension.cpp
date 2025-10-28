@@ -1,6 +1,6 @@
 #define DUCKDB_EXTENSION_MAIN
 
-#include "tera_extension.hpp"
+#include "minijinja_extension.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -13,39 +13,45 @@
 namespace duckdb {
 
 // Bar chart bind data structure
-struct TeraRenderBindData : public FunctionData {
+struct MinijinjaRenderBindData : public FunctionData {
 	string template_path;
 	bool autoescape = true;
 	vector<string> autoescape_on;
+	string undefined_behavior;
 	int optional_args = 0;
 
-	TeraRenderBindData(string template_path_p, bool autoescape_p, vector<string> autoescape_on_p, int optional_args_p)
+	MinijinjaRenderBindData(string template_path_p, bool autoescape_p, vector<string> autoescape_on_p,
+	                        string undefined_behavior_p, int optional_args_p)
 	    : template_path(std::move(template_path_p)), autoescape(autoescape_p),
-	      autoescape_on(std::move(autoescape_on_p)), optional_args(optional_args_p) {
+	      autoescape_on(std::move(autoescape_on_p)), undefined_behavior(std::move(undefined_behavior_p)),
+	      optional_args(optional_args_p) {
 	}
 
 	unique_ptr<FunctionData> Copy() const override;
 	bool Equals(const FunctionData &other_p) const override;
 };
 
-unique_ptr<FunctionData> TeraRenderBindData::Copy() const {
-	return make_uniq<TeraRenderBindData>(template_path, autoescape, autoescape_on, optional_args);
+unique_ptr<FunctionData> MinijinjaRenderBindData::Copy() const {
+	return make_uniq<MinijinjaRenderBindData>(template_path, autoescape, autoescape_on, undefined_behavior,
+	                                          optional_args);
 }
 
-bool TeraRenderBindData::Equals(const FunctionData &other_p) const {
-	auto &other = (const TeraRenderBindData &)other_p;
+bool MinijinjaRenderBindData::Equals(const FunctionData &other_p) const {
+	auto &other = (const MinijinjaRenderBindData &)other_p;
 	return template_path == other.template_path && autoescape == other.autoescape &&
-	       autoescape_on == other.autoescape_on && optional_args == other.optional_args;
+	       autoescape_on == other.autoescape_on && undefined_behavior == other.undefined_behavior &&
+	       optional_args == other.optional_args;
 }
 
-unique_ptr<FunctionData> TeraRenderBind(ClientContext &context, ScalarFunction &bound_function,
-                                        vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> MinijinjaRenderBind(ClientContext &context, ScalarFunction &bound_function,
+                                             vector<unique_ptr<Expression>> &arguments) {
 	if (arguments.empty()) {
-		throw BinderException("tera_render takes at least one argument");
+		throw BinderException("minijinja_render takes at least one argument");
 	}
 
 	// Optional arguments
 	string template_path;
+	string undefined_behavior = "lenient";
 	bool autoescape = true;
 	vector<string> autoescape_on;
 	int optional_args = 0;
@@ -56,7 +62,7 @@ unique_ptr<FunctionData> TeraRenderBind(ClientContext &context, ScalarFunction &
 			throw ParameterNotResolvedException();
 		}
 		if (!arg->IsFoldable()) {
-			throw BinderException("tera_render: arguments must be constant");
+			throw BinderException("minijinja_render: arguments must be constant");
 		}
 		const auto &alias = arg->GetAlias();
 		if (alias == "") {
@@ -65,22 +71,40 @@ unique_ptr<FunctionData> TeraRenderBind(ClientContext &context, ScalarFunction &
 		if (alias == "autoescape") {
 			optional_args++;
 			if (arg->return_type.id() != LogicalTypeId::BOOLEAN) {
-				throw BinderException("tera_render: 'autoescape' argument must be a BOOLEAN");
+				throw BinderException("minijinja_render: 'autoescape' argument must be a BOOLEAN");
 			}
 			autoescape = BooleanValue::Get(ExpressionExecutor::EvaluateScalar(context, *arg));
 		} else if (alias == "template_path") {
 			optional_args++;
 
 			if (arg->return_type.id() != LogicalTypeId::VARCHAR) {
-				throw BinderException("tera_render: 'template_path' argument must be a VARCHAR");
+				throw BinderException("minijinja_render: 'template_path' argument must be a VARCHAR");
 			}
 			template_path = StringValue::Get(ExpressionExecutor::EvaluateScalar(context, *arg));
+
+		} else if (alias == "undefined_behavior") {
+			optional_args++;
+
+			if (arg->return_type.id() != LogicalTypeId::VARCHAR) {
+				throw BinderException("minijinja_render: 'undefined_behavior' argument must be of enum type");
+			}
+			undefined_behavior = StringValue::Get(ExpressionExecutor::EvaluateScalar(context, *arg));
+
+			std::vector<string> valid_values = {"lenient", "strict", "chainable", "semi_strict"};
+
+			if (find(valid_values.begin(), valid_values.end(), undefined_behavior) == valid_values.end()) {
+				throw BinderException(
+				    StringUtil::Format("minijinja_render: 'undefined_behavior' argument has invalid value '%s' must be "
+				                       "one of: lenient, strict, chainable, semi_strict",
+				                       undefined_behavior));
+			}
+
 		} else if (alias == "autoescape_extensions") {
 			optional_args++;
 
 			if (arg->return_type.InternalType() != PhysicalType::LIST) {
 				throw BinderException(
-				    StringUtil::Format("tera_render: 'autoescape_on' argument must be a list of strings it is %s",
+				    StringUtil::Format("minijinja_render: 'autoescape_on' argument must be a list of strings it is %s",
 				                       arg->return_type.ToString()));
 			}
 
@@ -88,24 +112,25 @@ unique_ptr<FunctionData> TeraRenderBind(ClientContext &context, ScalarFunction &
 			for (const auto &list_item : list_children) {
 				// These should also be lists.
 				if (list_item.type() != LogicalType::VARCHAR) {
-					throw BinderException(
-					    StringUtil::Format("tera_render: 'autoescape_on' child must be a string it is %s value is %s",
-					                       list_item.type().ToString(), list_item.ToString()));
+					throw BinderException(StringUtil::Format(
+					    "minijinja_render: 'autoescape_on' child must be a string it is %s value is %s",
+					    list_item.type().ToString(), list_item.ToString()));
 				}
 
 				autoescape_on.push_back(list_item.GetValue<string>());
 			}
 		} else {
-			throw BinderException(StringUtil::Format("tera_render: Unknown argument '%s'", alias));
+			throw BinderException(StringUtil::Format("minijinja_render: Unknown argument '%s'", alias));
 		}
 	}
 
-	return make_uniq<TeraRenderBindData>(template_path, autoescape, autoescape_on, optional_args);
+	return make_uniq<MinijinjaRenderBindData>(template_path, autoescape, autoescape_on, undefined_behavior,
+	                                          optional_args);
 }
 
-inline void TeraRenderFunc(DataChunk &args, ExpressionState &state, Vector &result) {
+inline void MinijinjaRenderFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	const auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	const auto &bind_data = func_expr.bind_info->Cast<TeraRenderBindData>();
+	const auto &bind_data = func_expr.bind_info->Cast<MinijinjaRenderBindData>();
 
 	auto &expression_vector = args.data[0];
 	const auto count = args.size();
@@ -124,10 +149,10 @@ inline void TeraRenderFunc(DataChunk &args, ExpressionState &state, Vector &resu
 		BinaryExecutor::Execute<string_t, string_t, string_t>(
 		    expression_vector, context_json_vector, result, args.size(),
 		    [&](string_t expression, string_t context_json) {
-			    ResultCString eval_result =
-			        render_template(expression.GetData(), expression.GetSize(), context_json.GetData(),
-			                        context_json.GetSize(), bind_data.template_path.c_str(), bind_data.autoescape,
-			                        autoescape_on_ptrs.data(), static_cast<int32_t>(autoescape_on_ptrs.size()));
+			    ResultCString eval_result = render_template(
+			        expression.GetData(), expression.GetSize(), context_json.GetData(), context_json.GetSize(),
+			        bind_data.template_path.c_str(), bind_data.autoescape, bind_data.undefined_behavior.c_str(),
+			        autoescape_on_ptrs.data(), static_cast<int32_t>(autoescape_on_ptrs.size()));
 			    if (eval_result.tag == ResultCString::Tag::Err) {
 				    string err_str = string(eval_result.err._0);
 				    free_result_cstring(eval_result);
@@ -141,9 +166,10 @@ inline void TeraRenderFunc(DataChunk &args, ExpressionState &state, Vector &resu
 	} else if (args.ColumnCount() - bind_data.optional_args == 1) {
 		// No context column.
 		UnaryExecutor::Execute<string_t, string_t>(expression_vector, result, args.size(), [&](string_t expression) {
-			ResultCString eval_result = render_template(
-			    expression.GetData(), expression.GetSize(), "{}", 2, bind_data.template_path.c_str(),
-			    bind_data.autoescape, autoescape_on_ptrs.data(), static_cast<int32_t>(autoescape_on_ptrs.size()));
+			ResultCString eval_result =
+			    render_template(expression.GetData(), expression.GetSize(), "{}", 2, bind_data.template_path.c_str(),
+			                    bind_data.autoescape, bind_data.undefined_behavior.c_str(), autoescape_on_ptrs.data(),
+			                    static_cast<int32_t>(autoescape_on_ptrs.size()));
 			if (eval_result.tag == ResultCString::Tag::Err) {
 				string err_str = string(eval_result.err._0);
 				free_result_cstring(eval_result);
@@ -155,25 +181,25 @@ inline void TeraRenderFunc(DataChunk &args, ExpressionState &state, Vector &resu
 			}
 		});
 	} else {
-		throw InvalidInputException("Invalid number of arguments to tera_render");
+		throw InvalidInputException("Invalid number of arguments to minijinja_render");
 	}
 }
 
 // Extension initalization.
 static void LoadInternal(ExtensionLoader &loader) {
 	{
-		ScalarFunctionSet render("tera_render");
+		ScalarFunctionSet render("minijinja_render");
 
 		auto render_with_context =
-		    ScalarFunction({LogicalType::VARCHAR, LogicalType::JSON()}, LogicalType::VARCHAR, TeraRenderFunc,
-		                   TeraRenderBind, nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::ANY));
+		    ScalarFunction({LogicalType::VARCHAR, LogicalType::JSON()}, LogicalType::VARCHAR, MinijinjaRenderFunc,
+		                   MinijinjaRenderBind, nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::ANY));
 		render_with_context.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 		render_with_context.stability = FunctionStability::VOLATILE;
 		render.AddFunction(render_with_context);
 
 		auto render_no_context =
-		    ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, TeraRenderFunc, TeraRenderBind, nullptr,
-		                   nullptr, nullptr, LogicalType(LogicalTypeId::ANY));
+		    ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, MinijinjaRenderFunc, MinijinjaRenderBind,
+		                   nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::ANY));
 		render_no_context.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
 		render_no_context.stability = FunctionStability::VOLATILE;
 		render.AddFunction(render_no_context);
@@ -181,17 +207,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 		loader.RegisterFunction(render);
 	}
 
-	QueryFarmSendTelemetry(loader, "tera", "2025101901");
+	QueryFarmSendTelemetry(loader, "minijinja", "2025101901");
 }
 
-void TeraExtension::Load(ExtensionLoader &loader) {
+void MinijinjaExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
-std::string TeraExtension::Name() {
-	return "tera";
+std::string MinijinjaExtension::Name() {
+	return "minijinja";
 }
 
-std::string TeraExtension::Version() const {
+std::string MinijinjaExtension::Version() const {
 	return "2025101901";
 }
 
@@ -199,7 +225,7 @@ std::string TeraExtension::Version() const {
 
 extern "C" {
 
-DUCKDB_CPP_EXTENSION_ENTRY(tera, loader) {
+DUCKDB_CPP_EXTENSION_ENTRY(minijinja, loader) {
 	duckdb::LoadInternal(loader);
 }
 }

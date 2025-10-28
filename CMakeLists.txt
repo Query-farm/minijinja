@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED 1)
 
 
 # Set extension name here
-set(TARGET_NAME tera)
+set(TARGET_NAME minijinja)
 
 
 
@@ -89,8 +89,8 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Corrosion)
 
 # Import targets defined in a package or workspace manifest `Cargo.toml` file
-corrosion_import_crate(MANIFEST_PATH "${CMAKE_SOURCE_DIR}/../duckdb_tera_binding/Cargo.toml"
-CRATES "duckdb_tera_binding"
+corrosion_import_crate(MANIFEST_PATH "${CMAKE_SOURCE_DIR}/../duckdb_minijinja_binding/Cargo.toml"
+CRATES "duckdb_minijinja_binding"
 )
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
@@ -99,17 +99,17 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
-set(EXTENSION_SOURCES src/tera_extension.cpp
+set(EXTENSION_SOURCES src/minijinja_extension.cpp
 src/query_farm_telemetry.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 
-get_target_property(fake_includes duckdb_tera_binding INCLUDE_DIRECTORIES)
+get_target_property(fake_includes duckdb_minijinja_binding INCLUDE_DIRECTORIES)
 
-target_link_libraries(${EXTENSION_NAME} duckdb_tera_binding-static)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_tera_binding)
+target_link_libraries(${EXTENSION_NAME} duckdb_minijinja_binding-static)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} duckdb_minijinja_binding)
 
 
 install(
