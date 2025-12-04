@@ -207,7 +207,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		loader.RegisterFunction(render);
 	}
 
-	QueryFarmSendTelemetry(loader, "minijinja", "2025101901");
+	QueryFarmSendTelemetry(loader, "minijinja", MINIJINJA_EXTENSION_VERSION);
 }
 
 void MinijinjaExtension::Load(ExtensionLoader &loader) {
@@ -218,7 +218,7 @@ std::string MinijinjaExtension::Name() {
 }
 
 std::string MinijinjaExtension::Version() const {
-	return "2025101901";
+	return MINIJINJA_EXTENSION_VERSION;
 }
 
 } // namespace duckdb

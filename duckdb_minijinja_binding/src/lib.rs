@@ -12,6 +12,14 @@ pub enum ResultCString {
     Err(*mut c_char),
 }
 
+/// Converts a C char pointer and length to a Rust &str.
+///
+/// # Safety
+///
+/// This macro uses `str::from_utf8_unchecked` which is safe here because:
+/// - DuckDB's VARCHAR type guarantees valid UTF-8 encoding
+/// - All string data passed from DuckDB C++ layer is already validated as UTF-8
+/// - The caller must ensure the pointer is valid and the length is correct
 macro_rules! make_str {
     ($s:expr, $len:expr) => {
         unsafe { str::from_utf8_unchecked(slice::from_raw_parts($s as *const u8, $len)) }
