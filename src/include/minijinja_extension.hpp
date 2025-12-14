@@ -5,7 +5,7 @@
 namespace duckdb {
 
 // Extension version - update this single location when releasing new versions
-#define MINIJINJA_EXTENSION_VERSION "2025101901"
+#define MINIJINJA_EXTENSION_VERSION "2025121301"
 
 class MinijinjaExtension : public Extension {
 public:
