@@ -11,21 +11,33 @@ Catalog Error: Scalar Function with name minijinja_render does not exist!
 # Require statement will ensure this test is run with this extension loaded
 require minijinja
 
+# Test minijinja_render (template only, no context)
+query T
+SELECT minijinja_render('Hello World!')
+----
+Hello World!
+
+# Test minijinja_render with optional parameters
+query T
+SELECT minijinja_render('Hello & Goodbye!', autoescape := false)
+----
+Hello & Goodbye!
+
 # Render the template with a JSON context as the second argument
 query T
-SELECT minijinja_render('{{ foo }}', '{"foo": "bar"}')
+SELECT minijinja_render_with_context('{{ foo }}', '{"foo": "bar"}')
 ----
 bar
 
 # Demonstrate that by default autoescaping is applied.
 query T
-SELECT minijinja_render('{{ v }}', '{"v": "B&O"}')
+SELECT minijinja_render_with_context('{{ v }}', '{"v": "B&O"}')
 ----
 B&amp;O
 
 # Test that autoescaping can be disabled.
 query T
-SELECT minijinja_render('{{ v }}', '{"v": "B&O"}', autoescape := false)
+SELECT minijinja_render_with_context('{{ v }}', '{"v": "B&O"}', autoescape := false)
 ----
 B&O
 
@@ -33,12 +45,12 @@ B&O
 # Demonstrate how a template path can be specified and then the template
 # filename is passed as the first parameter
 query T
-SELECT minijinja_render('index.html', '{"v": "B&O"}', autoescape := false, template_path := './templates/')
+SELECT minijinja_render_with_context('index.html', '{"v": "B&O"}', autoescape := false, template_path := './templates/')
 ----
 B&O
 
 # Demonstrate the error that happens when a unknown template is specified.
 statement error
-SELECT minijinja_render('index2.html', '{"v": "B&O"}', autoescape := false, template_path := './template/')
+SELECT minijinja_render_with_context('index2.html', '{"v": "B&O"}', autoescape := false, template_path := './template/')
 ----
 Invalid Input Error: Error rendering template: MiniJinja render error: Error { kind: TemplateNotFound, detail: "template \"index2.html\" does not exist" }
