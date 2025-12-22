@@ -56,13 +56,15 @@ unique_ptr<FunctionData> MinijinjaRenderBind(ClientContext &context, ScalarFunct
 	vector<string> autoescape_on;
 	int optional_args = 0;
 
-	for (idx_t i = 1; i < arguments.size(); i++) {
+	idx_t start_idx = bound_function.name == "minijinja_render" ? 1 : 2;
+
+	for (idx_t i = start_idx; i < arguments.size(); i++) {
 		const auto &arg = arguments[i];
 		if (arg->HasParameter()) {
 			throw ParameterNotResolvedException();
 		}
 		if (!arg->IsFoldable()) {
-			throw BinderException("minijinja_render: ");
+			throw BinderException("minijinja_render: argument is not foldable, check that it is a proper type");
 		}
 		const auto &alias = arg->GetAlias();
 		if (alias == "") {
@@ -187,15 +189,9 @@ inline void MinijinjaRenderFunc(DataChunk &args, ExpressionState &state, Vector 
 
 // Extension initalization.
 static void LoadInternal(ExtensionLoader &loader) {
+	// Register minijinja_render (template only, no context)
 	{
 		ScalarFunctionSet render("minijinja_render");
-
-		auto render_with_context =
-		    ScalarFunction({LogicalType::VARCHAR, LogicalType::JSON()}, LogicalType::VARCHAR, MinijinjaRenderFunc,
-		                   MinijinjaRenderBind, nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::ANY));
-		render_with_context.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
-		render_with_context.stability = FunctionStability::VOLATILE;
-		render.AddFunction(render_with_context);
 
 		auto render_no_context =
 		    ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, MinijinjaRenderFunc, MinijinjaRenderBind,
@@ -206,7 +202,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 		CreateScalarFunctionInfo info(render);
 
-		// Documentation for single-argument version (template only)
 		FunctionDescription desc_no_context;
 		desc_no_context.description = "Render a Jinja2-style template using the MiniJinja templating engine";
 		desc_no_context.parameter_types = {LogicalType::VARCHAR};
@@ -214,12 +209,27 @@ static void LoadInternal(ExtensionLoader &loader) {
 		desc_no_context.examples = {"minijinja_render('Hello World!')"};
 		info.descriptions.push_back(desc_no_context);
 
-		// Documentation for two-argument version (template + context)
+		loader.RegisterFunction(info);
+	}
+
+	// Register minijinja_render_with_context (template + JSON context)
+	{
+		ScalarFunctionSet render_with_ctx("minijinja_render_with_context");
+
+		auto render_with_context =
+		    ScalarFunction({LogicalType::VARCHAR, LogicalType::JSON()}, LogicalType::VARCHAR, MinijinjaRenderFunc,
+		                   MinijinjaRenderBind, nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::ANY));
+		render_with_context.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+		render_with_context.stability = FunctionStability::VOLATILE;
+		render_with_ctx.AddFunction(render_with_context);
+
+		CreateScalarFunctionInfo info(render_with_ctx);
+
 		FunctionDescription desc_with_context;
 		desc_with_context.description = "Render a Jinja2-style template with a JSON context";
 		desc_with_context.parameter_types = {LogicalType::VARCHAR, LogicalType::JSON()};
 		desc_with_context.parameter_names = {"template", "context"};
-		desc_with_context.examples = {"minijinja_render('Hello {{ name }}!', '{\"name\": \"World\"}')"};
+		desc_with_context.examples = {"minijinja_render_with_context('Hello {{ name }}!', '{\"name\": \"World\"}')"};
 		info.descriptions.push_back(desc_with_context);
 
 		loader.RegisterFunction(info);
