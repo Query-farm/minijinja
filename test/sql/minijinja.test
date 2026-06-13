@@ -42,12 +42,9 @@ SELECT minijinja_render_with_context('{{ v }}', '{"v": "B&O"}', autoescape := fa
 B&O
 
 
-# Demonstrate how a template path can be specified and then the template
-# filename is passed as the first parameter
-query T
-SELECT minijinja_render_with_context('index.html', '{"v": "B&O"}', autoescape := false, template_path := './templates/')
-----
-B&O
+# NOTE: loading a template from a file on disk (template_path) is exercised in
+# minijinja.test_slow — it needs host filesystem access, which the wasm build
+# does not have, so it is kept out of the default suite.
 
 # Demonstrate the error that happens when a unknown template is specified.
 statement error
