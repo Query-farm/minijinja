@@ -1,181 +1,28 @@
+<p align="center">
+  <a href="https://query.farm">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://query.farm/media-kit/logo/wordmark-dark.svg">
+      <img alt="Query.Farm" src="https://query.farm/media-kit/logo/wordmark-light.svg" height="64">
+    </picture>
+  </a>
+</p>
+
 # DuckDB [MiniJinja](https://docs.rs/minijinja/) Extension by [Query.Farm](https://query.farm)
+
+[![DuckDB](https://img.shields.io/badge/DuckDB-community_extension-fdf1e0?logo=duckdb&logoColor=fff000)](https://duckdb.org/community_extensions/extensions/minijinja.html)
+[![v1.5 build](https://github.com/Query-farm/minijinja/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=v1.5)](https://github.com/Query-farm/minijinja/actions/workflows/MainDistributionPipeline.yml?query=branch%3Av1.5)
 
 The **MiniJinja** extension, developed by **[Query.Farm](https://query.farm)**, brings powerful template rendering capabilities directly to your SQL queries in DuckDB. Generate dynamic text, HTML, configuration files, and reports using the robust [MiniJinja](https://docs.rs/minijinja/latest/minijinja/) templating engine without leaving your database environment.
 
-## Use Cases
+## Documentation
 
-The MiniJinja extension is perfect for:
+Full documentation, including installation, usage, the function reference, and cookbook examples, is available at:
 
-- **Dynamic report generation**: Create custom formatted reports with data from your database
-- **Configuration file generation**: Generate config files, scripts, and infrastructure-as-code templates
-- **HTML/XML generation**: Build web pages, emails, and XML documents with database content
-- **Data transformation**: Convert structured data into various text formats
-- **Notification templates**: Create personalized messages, alerts, and communications
-- **ETL pipeline outputs**: Transform data into specific formats required by downstream systems
-- **Dynamic SQL generation**: Create parameterized queries and DDL statements
-- **Internationalization**: Generate localized content using template variables
+**[https://query.farm/products/extensions/minijinja](https://query.farm/products/extensions/minijinja)**
 
 ## Installation
-
-**`minijinja` is a [DuckDB Community Extension](https://github.com/duckdb/community-extensions).**
-
-You can now use this by using this SQL:
 
 ```sql
 INSTALL minijinja FROM community;
 LOAD minijinja;
 ```
-
-## Functions
-
-### `minijinja_render(template, context, ...options)`
-
-Renders MiniJinja templates with JSON context data and customizable options.
-
-**Basic Usage:**
-
-```sql
--- Simple variable substitution
-SELECT minijinja_render('{{ foo }}', '{"foo": "bar"}');
-┌────────────────────────────────────────────┐
-│ minijinja_render('{{ foo }}', '{"foo": "bar"}') │
-│                  varchar                   │
-├────────────────────────────────────────────┤
-│ bar                                        │
-└────────────────────────────────────────────┘
-
--- Template without context (will error if variables are referenced)
-SELECT minijinja_render('Hello, World!');
-┌──────────────────────────────┐
-│ minijinja_render('Hello, World!') │
-│           varchar            │
-├──────────────────────────────┤
-│ Hello, World!                │
-└──────────────────────────────┘
-```
-
-**Advanced Context Usage:**
-
-```sql
--- Complex JSON context with nested objects
-SELECT minijinja_render(
-    'Hello {{ user.name }}, you have {{ user.messages }} new messages!',
-    '{"user": {"name": "Alice", "messages": 5}}'
-) as output;
-┌───────────────────────────────────────┐
-│                output                 │
-│                varchar                │
-├───────────────────────────────────────┤
-│ Hello Alice, you have 5 new messages! │
-└───────────────────────────────────────┘
-
--- Using arrays and loops
-SELECT minijinja_render(
-    'Items: {% for item in items %}{{ item.name }}{% if not loop.last %}, {% endif %}{% endfor %}',
-    '{"items": [{"name": "Apple"}, {"name": "Banana"}, {"name": "Cherry"}]}'
-) as output;
-┌──────────────────────────────┐
-│            output            │
-│           varchar            │
-├──────────────────────────────┤
-│ Items: Apple, Banana, Cherry │
-└──────────────────────────────┘
-```
-
-**HTML Generation with Autoescaping:**
-
-```sql
--- Default autoescaping (enabled)
-SELECT minijinja_render('{{ v }}', '{"v": "B&O"}') as output;
-┌─────────┐
-│ output  │
-│ varchar │
-├─────────┤
-│ B&amp;O │
-└─────────┘
-
--- Disable autoescaping for raw output
-SELECT minijinja_render('{{ v }}', '{"v": "B&O"}', autoescape := false) as output;
-┌─────────┐
-│ output  │
-│ varchar │
-├─────────┤
-│ B&O     │
-└─────────┘
-```
-
-**Template File Rendering:**
-
-```sql
--- Render from template files with custom path
-SELECT minijinja_render(
-    'index.html',
-    '{"v": "B&O"}',
-    autoescape := false,
-    template_path := './templates'
-) as output;
-┌─────────┐
-│ output  │
-│ varchar │
-├─────────┤
-│ B&O     │
-└─────────┘
-```
-
-**Error Handling:**
-
-```sql
--- Template errors are reported clearly
-SELECT minijinja_render('{{ missing_var }}', undefined_behavior := 'strict');
-Invalid Input Error:
-Error rendering template: MiniJinja render error: Error { kind: UndefinedError, name: "<string>", line: 1 }
-
----------------------------------- <string> -----------------------------------
-   1 > {{ missing_var }}
-     i    ^^^^^^^^^^^ undefined value
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-No referenced variables
--------------------------------------------------------------------------------
-
--- File not found errors
-SELECT minijinja_render('nonexistent.html', '{}', template_path := './templates/*.html');
-Invalid Input Error:
-Error rendering template: MiniJinja render error: Error { kind: TemplateNotFound, detail: "template \"nonexistent.html\" does not exist" }
-```
-
-**Parameters:**
-
-- `template`: Template string or filename (when using `template_path`)
-- `context`: Any object that can be coerced to JSON, most often should be a JSON map.
-- `autoescape`: Boolean, enable/disable HTML autoescaping (default: `true`)
-- `autoescape_on`: `VARCHAR[]`, A list of file extensions where autoescaping should be applied.
-- `template_path`: Directory path for template files (enables file mode)
-- `undefined_behavior`: The behavior of MiniJinja when an undefined variable is encountered can be `strict`, `lenient`, `chainable` or `semistrict`.  See the [definitions of each type of behavior](https://docs.rs/minijinja/latest/minijinja/enum.UndefinedBehavior.html).
-
-**Template Syntax:**
-
-The MiniJinja extension uses the full [MiniJinja templating language](https://docs.rs/minijinja/latest/minijinja/syntax/index.html), which includes:
-
-- **Variables**: `{{ variable_name }}`
-- **Filters**: `{{ name | upper }}`, `{{ price | round(precision=2) }}`
-- **Control structures**:
-  ```
-  {% if condition %}...{% endif %}
-  {% for item in list %}...{% endfor %}
-  {% set var = value %}
-  ```
-- **Comments**: `{# This is a comment #}`
-- **Template inheritance**: `{% extends "base.html" %}`, `{% block content %}...{% endblock %}`
-- **Macros**: `{% macro button(text) %}...{% endmacro %}`
-
-## Available Filters
-
-MiniJinja includes many built-in [filters for data transformation](https://docs.rs/minijinja/latest/minijinja/filters/index.html).
-
-## Contributing
-
-The MiniJinja extension is open source and developed by [Query.Farm](https://query.farm). Contributions are welcome!
-
-## License
-
-[MIT License](LICENSE)
