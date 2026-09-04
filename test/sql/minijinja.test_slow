@@ -1,0 +1,14 @@
+# name: test/sql/minijinja.test_slow
+# description: Filesystem-backed templates (template_path). Requires host
+#   filesystem access, so it is excluded from the default suite (the wasm build
+#   has no host filesystem). Native CI still runs .test_slow.
+# group: [sql]
+
+require minijinja
+
+# Demonstrate how a template path can be specified and then the template
+# filename is passed as the first parameter
+query T
+SELECT minijinja_render_with_context('index.html', '{"v": "B&O"}', autoescape := false, template_path := './templates/')
+----
+B&O
