@@ -67,8 +67,11 @@ static unique_ptr<FunctionData> MinijinjaRenderBindInternal(BindScalarFunctionIn
 		                      name, undefined_behavior);
 	}
 
+	// Keep the list Value alive for the loop: ListValue::GetChildren returns a reference into it, and a temporary in
+	// a range-for initializer is destroyed before the loop body runs.
+	const auto autoescape_extensions = input.GetNonNullConstant("autoescape_extensions");
 	vector<string> autoescape_on;
-	for (const auto &extension : ListValue::GetChildren(input.GetNonNullConstant("autoescape_extensions"))) {
+	for (const auto &extension : ListValue::GetChildren(autoescape_extensions)) {
 		if (extension.IsNull()) {
 			throw BinderException("%s: 'autoescape_extensions' must not contain NULL", name);
 		}
