@@ -154,7 +154,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		ScalarFunction render_no_context({}, LogicalType::VARCHAR, MinijinjaRenderFunc, MinijinjaRenderBind);
 		render_no_context.GetSignature().AddParameter("template", LogicalType::VARCHAR);
 		AddRenderOptions(render_no_context);
-		render_no_context.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		render_no_context.SetNullHandling(FunctionNullHandling::DEFAULT_NULL_HANDLING);
 		render_no_context.SetVolatile();
 		render_no_context.SetFallible();
 		render.AddFunction(render_no_context);
@@ -182,7 +182,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    .AddParameter("template", LogicalType::VARCHAR)
 		    .AddParameter("context", LogicalType::JSON());
 		AddRenderOptions(render_with_context);
-		render_with_context.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		render_with_context.SetNullHandling(FunctionNullHandling::DEFAULT_NULL_HANDLING);
 		render_with_context.SetVolatile();
 		render_with_context.SetFallible();
 		render_with_ctx.AddFunction(render_with_context);

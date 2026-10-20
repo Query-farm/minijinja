@@ -133,11 +133,54 @@ SELECT minijinja_render('A & B', autoescape := 'false')
 ----
 A & B
 
-# The options must be non-NULL constants.
-statement error
+# NULL in, NULL out: an explicit NULL option makes the whole result NULL.
+query T
 SELECT minijinja_render('Hello', autoescape := NULL)
 ----
-must not be NULL
+NULL
+
+query T
+SELECT minijinja_render('Hello', template_path := NULL)
+----
+NULL
+
+query T
+SELECT minijinja_render('Hello', undefined_behavior := NULL)
+----
+NULL
+
+query T
+SELECT minijinja_render('Hello', autoescape_extensions := NULL)
+----
+NULL
+
+query T
+SELECT minijinja_render_with_context('{{ a }}', '{"a": 1}', autoescape := NULL)
+----
+NULL
+
+query T
+SELECT minijinja_render_with_context('{{ a }}', '{"a": 1}', template_path := NULL)
+----
+NULL
+
+query T
+SELECT minijinja_render_with_context('{{ a }}', '{"a": 1}', undefined_behavior := NULL)
+----
+NULL
+
+query T
+SELECT minijinja_render_with_context('{{ a }}', '{"a": 1}', autoescape_extensions := NULL)
+----
+NULL
+
+# A NULL context also gives NULL.
+query T
+SELECT minijinja_render_with_context('{{ a }}', NULL)
+----
+NULL
+
+# The options must be constants.
 
 statement error
 SELECT minijinja_render('Hello', autoescape := random() > 0.5)
