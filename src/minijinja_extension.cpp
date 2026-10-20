@@ -7,241 +7,194 @@
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/common/vector/string_vector.hpp"
-#include "duckdb/common/vector/unified_vector_format.hpp"
 
 #include "rust.h"
 #include "query_farm_telemetry.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
-// Bar chart bind data structure
+// The options shared by every minijinja_render* function. They are keyword-only parameters, so DuckDB matches
+// the names, casts the values to the declared types and fills in the defaults before the bind callback runs.
+static void AddRenderOptions(ScalarFunction &function) {
+	function.GetSignature()
+	    .AddKeywordOnly("autoescape", LogicalType::BOOLEAN, Value::BOOLEAN(true))
+	    .AddKeywordOnly("template_path", LogicalType::VARCHAR, Value(""))
+	    .AddKeywordOnly("undefined_behavior", LogicalType::VARCHAR, Value("lenient"))
+	    .AddKeywordOnly("autoescape_extensions", LogicalType::LIST(LogicalType::VARCHAR),
+	                    Value::LIST(LogicalType::VARCHAR, vector<Value>()));
+}
+
 struct MinijinjaRenderBindData : public FunctionData {
+	bool has_context;
 	string template_path;
 	bool autoescape = true;
 	vector<string> autoescape_on;
 	string undefined_behavior;
-	int optional_args = 0;
 
-	MinijinjaRenderBindData(string template_path_p, bool autoescape_p, vector<string> autoescape_on_p,
-	                        string undefined_behavior_p, int optional_args_p)
-	    : template_path(std::move(template_path_p)), autoescape(autoescape_p),
-	      autoescape_on(std::move(autoescape_on_p)), undefined_behavior(std::move(undefined_behavior_p)),
-	      optional_args(optional_args_p) {
+	MinijinjaRenderBindData(bool has_context_p, string template_path_p, bool autoescape_p,
+	                        vector<string> autoescape_on_p, string undefined_behavior_p)
+	    : has_context(has_context_p), template_path(std::move(template_path_p)), autoescape(autoescape_p),
+	      autoescape_on(std::move(autoescape_on_p)), undefined_behavior(std::move(undefined_behavior_p)) {
 	}
 
-	unique_ptr<FunctionData> Copy() const override;
-	bool Equals(const FunctionData &other_p) const override;
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<MinijinjaRenderBindData>(has_context, template_path, autoescape, autoescape_on,
+		                                          undefined_behavior);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<MinijinjaRenderBindData>();
+		return has_context == other.has_context && template_path == other.template_path &&
+		       autoescape == other.autoescape && autoescape_on == other.autoescape_on &&
+		       undefined_behavior == other.undefined_behavior;
+	}
 };
 
-unique_ptr<FunctionData> MinijinjaRenderBindData::Copy() const {
-	return make_uniq<MinijinjaRenderBindData>(template_path, autoescape, autoescape_on, undefined_behavior,
-	                                          optional_args);
-}
+static unique_ptr<FunctionData> MinijinjaRenderBindInternal(BindScalarFunctionInput &input, bool has_context) {
+	const auto &name = input.GetBoundFunction().GetName().GetIdentifierName();
 
-bool MinijinjaRenderBindData::Equals(const FunctionData &other_p) const {
-	auto &other = (const MinijinjaRenderBindData &)other_p;
-	return template_path == other.template_path && autoescape == other.autoescape &&
-	       autoescape_on == other.autoescape_on && undefined_behavior == other.undefined_behavior &&
-	       optional_args == other.optional_args;
-}
+	const auto autoescape = BooleanValue::Get(input.GetNonNullConstant("autoescape"));
+	auto template_path = StringValue::Get(input.GetNonNullConstant("template_path"));
 
-unique_ptr<FunctionData> MinijinjaRenderBind(BindScalarFunctionInput &input) {
-	auto &bound_function = input.GetBoundFunction();
-	auto &arguments = input.GetArguments();
-	auto argument_names = input.GetArgumentNames();
-	if (arguments.empty()) {
-		throw BinderException("minijinja_render takes at least one argument");
+	auto undefined_behavior = StringValue::Get(input.GetNonNullConstant("undefined_behavior"));
+	static const vector<string> valid_undefined_behaviors = {"lenient", "strict", "chainable", "semi_strict"};
+	if (std::find(valid_undefined_behaviors.begin(), valid_undefined_behaviors.end(), undefined_behavior) ==
+	    valid_undefined_behaviors.end()) {
+		throw BinderException("%s: 'undefined_behavior' argument has invalid value '%s' must be one of: lenient, "
+		                      "strict, chainable, semi_strict",
+		                      name, undefined_behavior);
 	}
 
-	// Optional arguments
-	string template_path;
-	string undefined_behavior = "lenient";
-	bool autoescape = true;
 	vector<string> autoescape_on;
-	int optional_args = 0;
-
-	idx_t start_idx = bound_function.GetName() == "minijinja_render" ? 1 : 2;
-
-	for (idx_t i = start_idx; i < arguments.size(); i++) {
-		const auto &arg = arguments[i];
-		if (arg->HasParameter()) {
-			throw ParameterNotResolvedException();
+	for (const auto &extension : ListValue::GetChildren(input.GetNonNullConstant("autoescape_extensions"))) {
+		if (extension.IsNull()) {
+			throw BinderException("%s: 'autoescape_extensions' must not contain NULL", name);
 		}
-		if (!arg->IsFoldable()) {
-			throw BinderException("minijinja_render: argument is not foldable, check that it is a proper type");
-		}
-		if (!argument_names || i >= argument_names->size()) {
-			continue;
-		}
-		const auto alias = (*argument_names)[i].GetIdentifierName();
-		if (alias == "") {
-			continue;
-		}
-		if (alias == "autoescape") {
-			optional_args++;
-			if (arg->GetReturnType().id() != LogicalTypeId::BOOLEAN) {
-				throw BinderException("minijinja_render: 'autoescape' argument must be a BOOLEAN");
-			}
-			autoescape = BooleanValue::Get(input.GetConstant(i));
-		} else if (alias == "template_path") {
-			optional_args++;
-
-			if (arg->GetReturnType().id() != LogicalTypeId::VARCHAR) {
-				throw BinderException("minijinja_render: 'template_path' argument must be a VARCHAR");
-			}
-			template_path = StringValue::Get(input.GetConstant(i));
-
-		} else if (alias == "undefined_behavior") {
-			optional_args++;
-
-			if (arg->GetReturnType().id() != LogicalTypeId::VARCHAR) {
-				throw BinderException("minijinja_render: 'undefined_behavior' argument must be of enum type");
-			}
-			undefined_behavior = StringValue::Get(input.GetConstant(i));
-
-			std::vector<string> valid_values = {"lenient", "strict", "chainable", "semi_strict"};
-
-			if (find(valid_values.begin(), valid_values.end(), undefined_behavior) == valid_values.end()) {
-				throw BinderException(
-				    StringUtil::Format("minijinja_render: 'undefined_behavior' argument has invalid value '%s' must be "
-				                       "one of: lenient, strict, chainable, semi_strict",
-				                       undefined_behavior));
-			}
-
-		} else if (alias == "autoescape_extensions") {
-			optional_args++;
-
-			if (arg->GetReturnType().InternalType() != PhysicalType::LIST) {
-				throw BinderException(
-				    StringUtil::Format("minijinja_render: 'autoescape_on' argument must be a list of strings it is %s",
-				                       arg->GetReturnType().ToString()));
-			}
-
-			const auto list_children = ListValue::GetChildren(input.GetConstant(i));
-			for (const auto &list_item : list_children) {
-				// These should also be lists.
-				if (list_item.type() != LogicalType::VARCHAR) {
-					throw BinderException(StringUtil::Format(
-					    "minijinja_render: 'autoescape_on' child must be a string it is %s value is %s",
-					    list_item.type().ToString(), list_item.ToString()));
-				}
-
-				autoescape_on.push_back(list_item.GetValue<string>());
-			}
-		} else {
-			throw BinderException(StringUtil::Format("minijinja_render: Unknown argument '%s'", alias));
-		}
+		autoescape_on.push_back(StringValue::Get(extension));
 	}
 
-	return make_uniq<MinijinjaRenderBindData>(template_path, autoescape, autoescape_on, undefined_behavior,
-	                                          optional_args);
+	return make_uniq<MinijinjaRenderBindData>(has_context, std::move(template_path), autoescape,
+	                                          std::move(autoescape_on), std::move(undefined_behavior));
+}
+
+static unique_ptr<FunctionData> MinijinjaRenderBind(BindScalarFunctionInput &input) {
+	return MinijinjaRenderBindInternal(input, false);
+}
+
+static unique_ptr<FunctionData> MinijinjaRenderWithContextBind(BindScalarFunctionInput &input) {
+	return MinijinjaRenderBindInternal(input, true);
+}
+
+static string_t RenderToVector(Vector &result, const MinijinjaRenderBindData &bind_data,
+                               vector<const char *> &autoescape_on_ptrs, string_t expression,
+                               const char *context_json, idx_t context_json_len) {
+	ResultCString eval_result =
+	    render_template(expression.GetData(), expression.GetSize(), context_json, context_json_len,
+	                    bind_data.template_path.c_str(), bind_data.autoescape, bind_data.undefined_behavior.c_str(),
+	                    autoescape_on_ptrs.data(), static_cast<int32_t>(autoescape_on_ptrs.size()));
+	if (eval_result.tag == ResultCString::Tag::Err) {
+		string err_str = string(eval_result.err._0);
+		free_result_cstring(eval_result);
+		throw InvalidInputException("Error rendering template: " + err_str);
+	}
+	auto vector_result = StringVector::AddString(result, eval_result.ok._0);
+	free_result_cstring(eval_result);
+	return vector_result;
 }
 
 inline void MinijinjaRenderFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	const auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	const auto &bind_data = func_expr.BindInfo()->Cast<MinijinjaRenderBindData>();
 
+	// The keyword-only options follow the positional arguments in the chunk; their values were captured at bind.
 	auto &expression_vector = args.data[0];
-	const auto count = args.size();
 
-	UnifiedVectorFormat expression_vector_unified;
-	expression_vector.ToUnifiedFormat(expression_vector_unified);
-
-	std::vector<const char *> autoescape_on_ptrs;
+	vector<const char *> autoescape_on_ptrs;
 	for (const auto &s : bind_data.autoescape_on) {
 		autoescape_on_ptrs.push_back(s.c_str());
 	}
 
-	if (args.ColumnCount() - bind_data.optional_args == 2) {
-		// There can be a context column.
+	if (bind_data.has_context) {
 		auto &context_json_vector = args.data[1];
 		BinaryExecutor::Execute<string_t, string_t, string_t>(
 		    expression_vector, context_json_vector, result, [&](string_t expression, string_t context_json) {
-			    ResultCString eval_result = render_template(
-			        expression.GetData(), expression.GetSize(), context_json.GetData(), context_json.GetSize(),
-			        bind_data.template_path.c_str(), bind_data.autoescape, bind_data.undefined_behavior.c_str(),
-			        autoescape_on_ptrs.data(), static_cast<int32_t>(autoescape_on_ptrs.size()));
-			    if (eval_result.tag == ResultCString::Tag::Err) {
-				    string err_str = string(eval_result.err._0);
-				    free_result_cstring(eval_result);
-				    throw InvalidInputException("Error rendering template: " + err_str);
-			    } else {
-				    auto vector_result = StringVector::AddString(result, eval_result.ok._0);
-				    free_result_cstring(eval_result);
-				    return vector_result;
-			    }
+			    return RenderToVector(result, bind_data, autoescape_on_ptrs, expression, context_json.GetData(),
+			                          context_json.GetSize());
 		    });
-	} else if (args.ColumnCount() - bind_data.optional_args == 1) {
-		// No context column.
-		UnaryExecutor::Execute<string_t, string_t>(expression_vector, result, [&](string_t expression) {
-			ResultCString eval_result =
-			    render_template(expression.GetData(), expression.GetSize(), "{}", 2, bind_data.template_path.c_str(),
-			                    bind_data.autoescape, bind_data.undefined_behavior.c_str(), autoescape_on_ptrs.data(),
-			                    static_cast<int32_t>(autoescape_on_ptrs.size()));
-			if (eval_result.tag == ResultCString::Tag::Err) {
-				string err_str = string(eval_result.err._0);
-				free_result_cstring(eval_result);
-				throw InvalidInputException("Error rendering template: " + err_str);
-			} else {
-				auto vector_result = StringVector::AddString(result, eval_result.ok._0);
-				free_result_cstring(eval_result);
-				return vector_result;
-			}
-		});
 	} else {
-		throw InvalidInputException("Invalid number of arguments to minijinja_render");
+		UnaryExecutor::Execute<string_t, string_t>(expression_vector, result, [&](string_t expression) {
+			return RenderToVector(result, bind_data, autoescape_on_ptrs, expression, "{}", 2);
+		});
 	}
+}
+
+static FunctionDescription MakeDescription(vector<string> names, vector<LogicalType> types, string description,
+                                           vector<string> examples) {
+	FunctionDescription desc;
+	desc.description = std::move(description);
+	// The keyword-only options, in the order AddRenderOptions declares them
+	names.insert(names.end(), {"autoescape", "template_path", "undefined_behavior", "autoescape_extensions"});
+	types.insert(types.end(), {LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                           LogicalType::LIST(LogicalType::VARCHAR)});
+	desc.parameter_names = std::move(names);
+	desc.parameter_types = std::move(types);
+	desc.examples = std::move(examples);
+	desc.categories = {"text", "template"};
+	return desc;
 }
 
 // Extension initalization.
 static void LoadInternal(ExtensionLoader &loader) {
-	// Register minijinja_render (template only, no context)
+	// minijinja_render(template, *, autoescape, template_path, undefined_behavior, autoescape_extensions)
 	{
 		ScalarFunctionSet render("minijinja_render");
 
-		auto render_no_context =
-		    ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, MinijinjaRenderFunc, MinijinjaRenderBind);
-		// Optional settings (autoescape, template_path, ...) are passed as named arguments
-		render_no_context.GetSignature().AddKwargs("kwargs", LogicalType::ANY);
+		ScalarFunction render_no_context({}, LogicalType::VARCHAR, MinijinjaRenderFunc, MinijinjaRenderBind);
+		render_no_context.GetSignature().AddParameter("template", LogicalType::VARCHAR);
+		AddRenderOptions(render_no_context);
 		render_no_context.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 		render_no_context.SetVolatile();
 		render_no_context.SetFallible();
 		render.AddFunction(render_no_context);
 
 		CreateScalarFunctionInfo info(render);
-
-		FunctionDescription desc_no_context;
-		desc_no_context.description = "Render a Jinja2-style template using the MiniJinja templating engine";
-		desc_no_context.parameter_types = {LogicalType::VARCHAR};
-		desc_no_context.parameter_names = {"template"};
-		desc_no_context.examples = {"minijinja_render('Hello World!')"};
-		info.descriptions.push_back(desc_no_context);
-
+		info.descriptions.push_back(
+		    MakeDescription({"template"}, {LogicalType::VARCHAR},
+		                    "Render a Jinja2-style template using the MiniJinja templating engine. Options are passed "
+		                    "by name: autoescape (default true), template_path (directory to load templates from, "
+		                    "default none), undefined_behavior (lenient, strict, chainable or semi_strict; default "
+		                    "lenient) and autoescape_extensions (default [])",
+		                    {"minijinja_render('Hello World!')",
+		                     "minijinja_render('Hello & Goodbye!', autoescape := false)"}));
 		loader.RegisterFunction(info);
 	}
 
-	// Register minijinja_render_with_context (template + JSON context)
+	// minijinja_render_with_context(template, context, *, autoescape, template_path, undefined_behavior,
+	//                               autoescape_extensions)
 	{
 		ScalarFunctionSet render_with_ctx("minijinja_render_with_context");
 
-		auto render_with_context = ScalarFunction({LogicalType::VARCHAR, LogicalType::JSON()}, LogicalType::VARCHAR,
-		                                          MinijinjaRenderFunc, MinijinjaRenderBind);
-		// Optional settings (autoescape, template_path, ...) are passed as named arguments
-		render_with_context.GetSignature().AddKwargs("kwargs", LogicalType::ANY);
+		ScalarFunction render_with_context({}, LogicalType::VARCHAR, MinijinjaRenderFunc,
+		                                   MinijinjaRenderWithContextBind);
+		render_with_context.GetSignature()
+		    .AddParameter("template", LogicalType::VARCHAR)
+		    .AddParameter("context", LogicalType::JSON());
+		AddRenderOptions(render_with_context);
 		render_with_context.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
 		render_with_context.SetVolatile();
 		render_with_context.SetFallible();
 		render_with_ctx.AddFunction(render_with_context);
 
 		CreateScalarFunctionInfo info(render_with_ctx);
-
-		FunctionDescription desc_with_context;
-		desc_with_context.description = "Render a Jinja2-style template with a JSON context";
-		desc_with_context.parameter_types = {LogicalType::VARCHAR, LogicalType::JSON()};
-		desc_with_context.parameter_names = {"template", "context"};
-		desc_with_context.examples = {"minijinja_render_with_context('Hello {{ name }}!', '{\"name\": \"World\"}')"};
-		info.descriptions.push_back(desc_with_context);
-
+		info.descriptions.push_back(MakeDescription(
+		    {"template", "context"}, {LogicalType::VARCHAR, LogicalType::JSON()},
+		    "Render a Jinja2-style template with a JSON context. Options are passed by name: autoescape (default "
+		    "true), template_path (directory to load templates from, default none), undefined_behavior (lenient, "
+		    "strict, chainable or semi_strict; default lenient) and autoescape_extensions (default [])",
+		    {"minijinja_render_with_context('Hello {{ name }}!', '{\"name\": \"World\"}')",
+		     "minijinja_render_with_context('{{ missing }}', '{}', undefined_behavior := 'strict')"}));
 		loader.RegisterFunction(info);
 	}
 
