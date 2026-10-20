@@ -6,6 +6,8 @@
 #include "duckdb/function/scalar_function.hpp"
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/vector/unified_vector_format.hpp"
 
 #include "rust.h"
 #include "query_farm_telemetry.hpp"
@@ -43,8 +45,10 @@ bool MinijinjaRenderBindData::Equals(const FunctionData &other_p) const {
 	       optional_args == other.optional_args;
 }
 
-unique_ptr<FunctionData> MinijinjaRenderBind(ClientContext &context, ScalarFunction &bound_function,
-                                             vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> MinijinjaRenderBind(BindScalarFunctionInput &input) {
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
+	auto argument_names = input.GetArgumentNames();
 	if (arguments.empty()) {
 		throw BinderException("minijinja_render takes at least one argument");
 	}
@@ -56,7 +60,7 @@ unique_ptr<FunctionData> MinijinjaRenderBind(ClientContext &context, ScalarFunct
 	vector<string> autoescape_on;
 	int optional_args = 0;
 
-	idx_t start_idx = bound_function.name == "minijinja_render" ? 1 : 2;
+	idx_t start_idx = bound_function.GetName() == "minijinja_render" ? 1 : 2;
 
 	for (idx_t i = start_idx; i < arguments.size(); i++) {
 		const auto &arg = arguments[i];
@@ -66,31 +70,34 @@ unique_ptr<FunctionData> MinijinjaRenderBind(ClientContext &context, ScalarFunct
 		if (!arg->IsFoldable()) {
 			throw BinderException("minijinja_render: argument is not foldable, check that it is a proper type");
 		}
-		const auto &alias = arg->GetAlias();
+		if (!argument_names || i >= argument_names->size()) {
+			continue;
+		}
+		const auto alias = (*argument_names)[i].GetIdentifierName();
 		if (alias == "") {
 			continue;
 		}
 		if (alias == "autoescape") {
 			optional_args++;
-			if (arg->return_type.id() != LogicalTypeId::BOOLEAN) {
+			if (arg->GetReturnType().id() != LogicalTypeId::BOOLEAN) {
 				throw BinderException("minijinja_render: 'autoescape' argument must be a BOOLEAN");
 			}
-			autoescape = BooleanValue::Get(ExpressionExecutor::EvaluateScalar(context, *arg));
+			autoescape = BooleanValue::Get(input.GetConstant(i));
 		} else if (alias == "template_path") {
 			optional_args++;
 
-			if (arg->return_type.id() != LogicalTypeId::VARCHAR) {
+			if (arg->GetReturnType().id() != LogicalTypeId::VARCHAR) {
 				throw BinderException("minijinja_render: 'template_path' argument must be a VARCHAR");
 			}
-			template_path = StringValue::Get(ExpressionExecutor::EvaluateScalar(context, *arg));
+			template_path = StringValue::Get(input.GetConstant(i));
 
 		} else if (alias == "undefined_behavior") {
 			optional_args++;
 
-			if (arg->return_type.id() != LogicalTypeId::VARCHAR) {
+			if (arg->GetReturnType().id() != LogicalTypeId::VARCHAR) {
 				throw BinderException("minijinja_render: 'undefined_behavior' argument must be of enum type");
 			}
-			undefined_behavior = StringValue::Get(ExpressionExecutor::EvaluateScalar(context, *arg));
+			undefined_behavior = StringValue::Get(input.GetConstant(i));
 
 			std::vector<string> valid_values = {"lenient", "strict", "chainable", "semi_strict"};
 
@@ -104,13 +111,13 @@ unique_ptr<FunctionData> MinijinjaRenderBind(ClientContext &context, ScalarFunct
 		} else if (alias == "autoescape_extensions") {
 			optional_args++;
 
-			if (arg->return_type.InternalType() != PhysicalType::LIST) {
+			if (arg->GetReturnType().InternalType() != PhysicalType::LIST) {
 				throw BinderException(
 				    StringUtil::Format("minijinja_render: 'autoescape_on' argument must be a list of strings it is %s",
-				                       arg->return_type.ToString()));
+				                       arg->GetReturnType().ToString()));
 			}
 
-			const auto list_children = ListValue::GetChildren(ExpressionExecutor::EvaluateScalar(context, *arg));
+			const auto list_children = ListValue::GetChildren(input.GetConstant(i));
 			for (const auto &list_item : list_children) {
 				// These should also be lists.
 				if (list_item.type() != LogicalType::VARCHAR) {
@@ -132,13 +139,13 @@ unique_ptr<FunctionData> MinijinjaRenderBind(ClientContext &context, ScalarFunct
 
 inline void MinijinjaRenderFunc(DataChunk &args, ExpressionState &state, Vector &result) {
 	const auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	const auto &bind_data = func_expr.bind_info->Cast<MinijinjaRenderBindData>();
+	const auto &bind_data = func_expr.BindInfo()->Cast<MinijinjaRenderBindData>();
 
 	auto &expression_vector = args.data[0];
 	const auto count = args.size();
 
 	UnifiedVectorFormat expression_vector_unified;
-	expression_vector.ToUnifiedFormat(count, expression_vector_unified);
+	expression_vector.ToUnifiedFormat(expression_vector_unified);
 
 	std::vector<const char *> autoescape_on_ptrs;
 	for (const auto &s : bind_data.autoescape_on) {
@@ -149,8 +156,7 @@ inline void MinijinjaRenderFunc(DataChunk &args, ExpressionState &state, Vector 
 		// There can be a context column.
 		auto &context_json_vector = args.data[1];
 		BinaryExecutor::Execute<string_t, string_t, string_t>(
-		    expression_vector, context_json_vector, result, args.size(),
-		    [&](string_t expression, string_t context_json) {
+		    expression_vector, context_json_vector, result, [&](string_t expression, string_t context_json) {
 			    ResultCString eval_result = render_template(
 			        expression.GetData(), expression.GetSize(), context_json.GetData(), context_json.GetSize(),
 			        bind_data.template_path.c_str(), bind_data.autoescape, bind_data.undefined_behavior.c_str(),
@@ -167,7 +173,7 @@ inline void MinijinjaRenderFunc(DataChunk &args, ExpressionState &state, Vector 
 		    });
 	} else if (args.ColumnCount() - bind_data.optional_args == 1) {
 		// No context column.
-		UnaryExecutor::Execute<string_t, string_t>(expression_vector, result, args.size(), [&](string_t expression) {
+		UnaryExecutor::Execute<string_t, string_t>(expression_vector, result, [&](string_t expression) {
 			ResultCString eval_result =
 			    render_template(expression.GetData(), expression.GetSize(), "{}", 2, bind_data.template_path.c_str(),
 			                    bind_data.autoescape, bind_data.undefined_behavior.c_str(), autoescape_on_ptrs.data(),
@@ -194,10 +200,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 		ScalarFunctionSet render("minijinja_render");
 
 		auto render_no_context =
-		    ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, MinijinjaRenderFunc, MinijinjaRenderBind,
-		                   nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::ANY));
-		render_no_context.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
-		render_no_context.stability = FunctionStability::VOLATILE;
+		    ScalarFunction({LogicalType::VARCHAR}, LogicalType::VARCHAR, MinijinjaRenderFunc, MinijinjaRenderBind);
+		// Optional settings (autoescape, template_path, ...) are passed as named arguments
+		render_no_context.GetSignature().AddKwargs("kwargs", LogicalType::ANY);
+		render_no_context.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		render_no_context.SetVolatile();
+		render_no_context.SetFallible();
 		render.AddFunction(render_no_context);
 
 		CreateScalarFunctionInfo info(render);
@@ -216,11 +224,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	{
 		ScalarFunctionSet render_with_ctx("minijinja_render_with_context");
 
-		auto render_with_context =
-		    ScalarFunction({LogicalType::VARCHAR, LogicalType::JSON()}, LogicalType::VARCHAR, MinijinjaRenderFunc,
-		                   MinijinjaRenderBind, nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::ANY));
-		render_with_context.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
-		render_with_context.stability = FunctionStability::VOLATILE;
+		auto render_with_context = ScalarFunction({LogicalType::VARCHAR, LogicalType::JSON()}, LogicalType::VARCHAR,
+		                                          MinijinjaRenderFunc, MinijinjaRenderBind);
+		// Optional settings (autoescape, template_path, ...) are passed as named arguments
+		render_with_context.GetSignature().AddKwargs("kwargs", LogicalType::ANY);
+		render_with_context.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+		render_with_context.SetVolatile();
+		render_with_context.SetFallible();
 		render_with_ctx.AddFunction(render_with_context);
 
 		CreateScalarFunctionInfo info(render_with_ctx);
