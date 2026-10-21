@@ -1,218 +1,165 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "minijinja_extension.hpp"
-#include "duckdb.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
-#include "duckdb/function/scalar_function.hpp"
-#include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/common/vector/string_vector.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/extension_load_options.hpp"
+#include "duckdb/main/extension_repository_manager.hpp"
 
-#include "rust.h"
-#include "query_farm_telemetry.hpp"
-
-#include <algorithm>
+// For DuckDB 2.0 and later this extension is distributed from the Query.Farm extension repository. The build published to the
+// DuckDB community repository only keeps the name. When the user has already added the Query.Farm repository and
+// installed the extension from it, loading this build loads that one; otherwise it explains the remaining steps.
+// It never adds the repository or installs anything itself: trusting a repository is the user's decision.
 
 namespace duckdb {
 
-// The options shared by every minijinja_render* function. They are keyword-only parameters, so DuckDB matches
-// the names, casts the values to the declared types and fills in the defaults before the bind callback runs.
-static void AddRenderOptions(ScalarFunction &function) {
-	function.GetSignature()
-	    .AddKeywordOnly("autoescape", LogicalType::BOOLEAN, Value::BOOLEAN(true))
-	    .AddKeywordOnly("template_path", LogicalType::VARCHAR, Value(""))
-	    .AddKeywordOnly("undefined_behavior", LogicalType::VARCHAR, Value("lenient"))
-	    .AddKeywordOnly("autoescape_extensions", LogicalType::LIST(LogicalType::VARCHAR),
-	                    Value::LIST(LogicalType::VARCHAR, vector<Value>()));
+static constexpr const char *EXTENSION_NAME = "minijinja";
+static constexpr const char *EXTENSION_VERSION = "2026102001";
+static constexpr const char *REPOSITORY_NAME = "query_farm";
+static constexpr const char *REPOSITORY_URL = "https://duckdb-extensions.query.farm";
+static constexpr const char *REPOSITORY_HTTP_URL = "http://duckdb-extensions.query.farm";
+// sha256 fingerprints of the Query.Farm repository signing keys (primary and standby)
+static constexpr const char *REPOSITORY_KEY_FINGERPRINTS[] = {
+    "sha256:b293ba6145db8f51f301618f59a720cb8c0c21e7efc6119aab43ea5c708947b5",
+    "sha256:6959de1c16b783b14d4c904f69361811f737017d79ea7078729a74ec2f7f7753"};
+
+static string MovedPreamble() {
+	return StringUtil::Format("The %s extension for DuckDB 2.0 and later is distributed from the Query.Farm extension repository, "
+	                          "not the DuckDB community repository.\n\n",
+	                          EXTENSION_NAME);
 }
 
-struct MinijinjaRenderBindData : public FunctionData {
-	bool has_context;
-	string template_path;
-	bool autoescape = true;
-	vector<string> autoescape_on;
-	string undefined_behavior;
+static string MoreInformation() {
+	return StringUtil::Format("\n\nMore information: https://query.farm/products/extensions/%s/", EXTENSION_NAME);
+}
 
-	MinijinjaRenderBindData(bool has_context_p, string template_path_p, bool autoescape_p,
-	                        vector<string> autoescape_on_p, string undefined_behavior_p)
-	    : has_context(has_context_p), template_path(std::move(template_path_p)), autoescape(autoescape_p),
-	      autoescape_on(std::move(autoescape_on_p)), undefined_behavior(std::move(undefined_behavior_p)) {
-	}
-
-	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<MinijinjaRenderBindData>(has_context, template_path, autoescape, autoescape_on,
-		                                          undefined_behavior);
-	}
-
-	bool Equals(const FunctionData &other_p) const override {
-		auto &other = other_p.Cast<MinijinjaRenderBindData>();
-		return has_context == other.has_context && template_path == other.template_path &&
-		       autoescape == other.autoescape && autoescape_on == other.autoescape_on &&
-		       undefined_behavior == other.undefined_behavior;
-	}
-};
-
-static unique_ptr<FunctionData> MinijinjaRenderBindInternal(BindScalarFunctionInput &input, bool has_context) {
-	const auto &name = input.GetBoundFunction().GetName().GetIdentifierName();
-
-	const auto autoescape = BooleanValue::Get(input.GetNonNullConstant("autoescape"));
-	auto template_path = StringValue::Get(input.GetNonNullConstant("template_path"));
-
-	auto undefined_behavior = StringValue::Get(input.GetNonNullConstant("undefined_behavior"));
-	static const vector<string> valid_undefined_behaviors = {"lenient", "strict", "chainable", "semi_strict"};
-	if (std::find(valid_undefined_behaviors.begin(), valid_undefined_behaviors.end(), undefined_behavior) ==
-	    valid_undefined_behaviors.end()) {
-		throw BinderException("%s: 'undefined_behavior' argument has invalid value '%s' must be one of: lenient, "
-		                      "strict, chainable, semi_strict",
-		                      name, undefined_behavior);
-	}
-
-	// Keep the list Value alive for the loop: ListValue::GetChildren returns a reference into it, and a temporary in
-	// a range-for initializer is destroyed before the loop body runs.
-	const auto autoescape_extensions = input.GetNonNullConstant("autoescape_extensions");
-	vector<string> autoescape_on;
-	for (const auto &extension : ListValue::GetChildren(autoescape_extensions)) {
-		if (extension.IsNull()) {
-			throw BinderException("%s: 'autoescape_extensions' must not contain NULL", name);
+static bool IsInstalledFromRepository(DatabaseInstance &db, FileSystem &fs) {
+	for (auto &directory : ExtensionHelper::GetExtensionDirectoryPath(db, fs)) {
+		auto path = fs.JoinPath(fs.JoinPath(fs.JoinPath(directory, "repositories"), REPOSITORY_NAME),
+		                        string(EXTENSION_NAME) + ".duckdb_extension");
+		if (fs.FileExists(path)) {
+			return true;
 		}
-		autoescape_on.push_back(StringValue::Get(extension));
 	}
-
-	return make_uniq<MinijinjaRenderBindData>(has_context, std::move(template_path), autoescape,
-	                                          std::move(autoescape_on), std::move(undefined_behavior));
+	return false;
 }
 
-static unique_ptr<FunctionData> MinijinjaRenderBind(BindScalarFunctionInput &input) {
-	return MinijinjaRenderBindInternal(input, false);
+// A repository named query_farm is only used when it points at the Query.Farm prefix and pins a Query.Farm signing key.
+static bool IsQueryFarmRepository(const ExtensionRepository &repository) {
+	auto prefix = StringUtil::Lower(repository.path);
+	while (StringUtil::EndsWith(prefix, "/")) {
+		prefix.pop_back();
+	}
+	if (prefix != REPOSITORY_URL && prefix != REPOSITORY_HTTP_URL) {
+		return false;
+	}
+	for (auto &key : repository.public_keys) {
+		auto fingerprint = ExtensionRepositoryManager::GetPublicKeyFingerprint(key);
+		for (auto trusted : REPOSITORY_KEY_FINGERPRINTS) {
+			if (fingerprint == trusted) {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
-static unique_ptr<FunctionData> MinijinjaRenderWithContextBind(BindScalarFunctionInput &input) {
-	return MinijinjaRenderBindInternal(input, true);
-}
+static void LoadFromQueryFarmOrExplain(DatabaseInstance &db) {
+	auto &fs = FileSystem::GetFileSystem(db);
+	ExtensionRepository repository;
+	bool has_repository = ExtensionRepositoryManager::TryGetRepository(db, fs, REPOSITORY_NAME, repository);
 
-static string_t RenderToVector(Vector &result, const MinijinjaRenderBindData &bind_data,
-                               vector<const char *> &autoescape_on_ptrs, string_t expression,
-                               const char *context_json, idx_t context_json_len) {
-	ResultCString eval_result =
-	    render_template(expression.GetData(), expression.GetSize(), context_json, context_json_len,
-	                    bind_data.template_path.c_str(), bind_data.autoescape, bind_data.undefined_behavior.c_str(),
-	                    autoescape_on_ptrs.data(), static_cast<int32_t>(autoescape_on_ptrs.size()));
-	if (eval_result.tag == ResultCString::Tag::Err) {
-		string err_str = string(eval_result.err._0);
-		free_result_cstring(eval_result);
-		throw InvalidInputException("Error rendering template: " + err_str);
+	if (!has_repository) {
+		throw MissingExtensionException(
+		    "%sAdd the repository and install the extension once:\n"
+		    "\n"
+		    "    SET allow_extension_repositories = 'allowed';\n"
+		    "    CREATE EXTENSION REPOSITORY IF NOT EXISTS %s WITH PREFIX '%s';\n"
+		    "    INSTALL %s FROM %s;\n"
+		    "\n"
+		    "Then load it in each session with:\n"
+		    "\n"
+		    "    LOAD %s FROM %s;%s",
+		    MovedPreamble(), REPOSITORY_NAME, REPOSITORY_URL, EXTENSION_NAME, REPOSITORY_NAME, EXTENSION_NAME,
+		    REPOSITORY_NAME, MoreInformation());
 	}
-	auto vector_result = StringVector::AddString(result, eval_result.ok._0);
-	free_result_cstring(eval_result);
-	return vector_result;
-}
-
-inline void MinijinjaRenderFunc(DataChunk &args, ExpressionState &state, Vector &result) {
-	const auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-	const auto &bind_data = func_expr.BindInfo()->Cast<MinijinjaRenderBindData>();
-
-	// The keyword-only options follow the positional arguments in the chunk; their values were captured at bind.
-	auto &expression_vector = args.data[0];
-
-	vector<const char *> autoescape_on_ptrs;
-	for (const auto &s : bind_data.autoescape_on) {
-		autoescape_on_ptrs.push_back(s.c_str());
+	if (!IsQueryFarmRepository(repository)) {
+		throw MissingExtensionException(
+		    "%sA repository named %s is configured with the prefix '%s', but it is not the Query.Farm extension "
+		    "repository: it points somewhere else or does not use the Query.Farm signing keys, so the extension is not "
+		    "loaded from it. Replace it with the Query.Farm repository and reinstall the extension:\n"
+		    "\n"
+		    "    SET allow_extension_repositories = 'allowed';\n"
+		    "    CREATE OR REPLACE EXTENSION REPOSITORY %s WITH PREFIX '%s';\n"
+		    "    FORCE INSTALL %s FROM %s;\n"
+		    "\n"
+		    "Then load it in each session with:\n"
+		    "\n"
+		    "    LOAD %s FROM %s;%s",
+		    MovedPreamble(), REPOSITORY_NAME, repository.path, REPOSITORY_NAME, REPOSITORY_URL, EXTENSION_NAME,
+		    REPOSITORY_NAME, EXTENSION_NAME, REPOSITORY_NAME, MoreInformation());
 	}
-
-	if (bind_data.has_context) {
-		auto &context_json_vector = args.data[1];
-		BinaryExecutor::Execute<string_t, string_t, string_t>(
-		    expression_vector, context_json_vector, result, [&](string_t expression, string_t context_json) {
-			    return RenderToVector(result, bind_data, autoescape_on_ptrs, expression, context_json.GetData(),
-			                          context_json.GetSize());
-		    });
-	} else {
-		UnaryExecutor::Execute<string_t, string_t>(expression_vector, result, [&](string_t expression) {
-			return RenderToVector(result, bind_data, autoescape_on_ptrs, expression, "{}", 2);
-		});
+	if (ExtensionRepositoryManager::GetAccess(db) == ExtensionRepositoryAccess::FORBIDDEN) {
+		throw MissingExtensionException("%sThe %s repository is configured, but allow_extension_repositories is set to "
+		                                "'forbidden', so extensions from it cannot be loaded.%s",
+		                                MovedPreamble(), REPOSITORY_NAME, MoreInformation());
 	}
-}
-
-static FunctionDescription MakeDescription(vector<string> names, vector<LogicalType> types, string description,
-                                           vector<string> examples) {
-	FunctionDescription desc;
-	desc.description = std::move(description);
-	// The keyword-only options, in the order AddRenderOptions declares them
-	names.insert(names.end(), {"autoescape", "template_path", "undefined_behavior", "autoescape_extensions"});
-	types.insert(types.end(), {LogicalType::BOOLEAN, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                           LogicalType::LIST(LogicalType::VARCHAR)});
-	desc.parameter_names = std::move(names);
-	desc.parameter_types = std::move(types);
-	desc.examples = std::move(examples);
-	desc.categories = {"text", "template"};
-	return desc;
-}
-
-// Extension initalization.
-static void LoadInternal(ExtensionLoader &loader) {
-	// minijinja_render(template, *, autoescape, template_path, undefined_behavior, autoescape_extensions)
-	{
-		ScalarFunctionSet render("minijinja_render");
-
-		ScalarFunction render_no_context({}, LogicalType::VARCHAR, MinijinjaRenderFunc, MinijinjaRenderBind);
-		render_no_context.GetSignature().AddParameter("template", LogicalType::VARCHAR);
-		AddRenderOptions(render_no_context);
-		render_no_context.SetNullHandling(FunctionNullHandling::DEFAULT_NULL_HANDLING);
-		render_no_context.SetVolatile();
-		render_no_context.SetFallible();
-		render.AddFunction(render_no_context);
-
-		CreateScalarFunctionInfo info(render);
-		info.descriptions.push_back(
-		    MakeDescription({"template"}, {LogicalType::VARCHAR},
-		                    "Render a Jinja2-style template using the MiniJinja templating engine. Options are passed "
-		                    "by name: autoescape (default true), template_path (directory to load templates from, "
-		                    "default none), undefined_behavior (lenient, strict, chainable or semi_strict; default "
-		                    "lenient) and autoescape_extensions (default [])",
-		                    {"minijinja_render('Hello World!')",
-		                     "minijinja_render('Hello & Goodbye!', autoescape := false)"}));
-		loader.RegisterFunction(info);
+	if (!IsInstalledFromRepository(db, fs)) {
+		throw MissingExtensionException("%sThe %s repository is already configured. Install the extension from it once:\n"
+		                                "\n"
+		                                "    SET allow_extension_repositories = 'allowed';\n"
+		                                "    INSTALL %s FROM %s;\n"
+		                                "\n"
+		                                "Then load it in each session with:\n"
+		                                "\n"
+		                                "    LOAD %s FROM %s;%s",
+		                                MovedPreamble(), REPOSITORY_NAME, EXTENSION_NAME, REPOSITORY_NAME,
+		                                EXTENSION_NAME, REPOSITORY_NAME, MoreInformation());
 	}
 
-	// minijinja_render_with_context(template, context, *, autoescape, template_path, undefined_behavior,
-	//                               autoescape_extensions)
-	{
-		ScalarFunctionSet render_with_ctx("minijinja_render_with_context");
-
-		ScalarFunction render_with_context({}, LogicalType::VARCHAR, MinijinjaRenderFunc,
-		                                   MinijinjaRenderWithContextBind);
-		render_with_context.GetSignature()
-		    .AddParameter("template", LogicalType::VARCHAR)
-		    .AddParameter("context", LogicalType::JSON());
-		AddRenderOptions(render_with_context);
-		render_with_context.SetNullHandling(FunctionNullHandling::DEFAULT_NULL_HANDLING);
-		render_with_context.SetVolatile();
-		render_with_context.SetFallible();
-		render_with_ctx.AddFunction(render_with_context);
-
-		CreateScalarFunctionInfo info(render_with_ctx);
-		info.descriptions.push_back(MakeDescription(
-		    {"template", "context"}, {LogicalType::VARCHAR, LogicalType::JSON()},
-		    "Render a Jinja2-style template with a JSON context. Options are passed by name: autoescape (default "
-		    "true), template_path (directory to load templates from, default none), undefined_behavior (lenient, "
-		    "strict, chainable or semi_strict; default lenient) and autoescape_extensions (default [])",
-		    {"minijinja_render_with_context('Hello {{ name }}!', '{\"name\": \"World\"}')",
-		     "minijinja_render_with_context('{{ missing }}', '{}', undefined_behavior := 'strict')"}));
-		loader.RegisterFunction(info);
+	// The repository is trusted and the extension is installed from it: load that build. DuckDB holds the load lock
+	// for this name while this stub initializes, so the real extension is loaded under an alias; its functions are
+	// registered as usual.
+	ExtensionLoadOptions options(EXTENSION_NAME);
+	options.repository = REPOSITORY_NAME;
+	options.alias = Identifier(string(EXTENSION_NAME) + "_" + REPOSITORY_NAME);
+	try {
+		ExtensionHelper::LoadExternalExtension(db, fs, options);
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		if (error.Type() != ExceptionType::IO || !StringUtil::Contains(error.RawMessage(), "signature")) {
+			throw;
+		}
+		throw MissingExtensionException(
+		    "%sThe %s extension installed from the %s repository failed signature verification. The file may be "
+		    "damaged, or it was signed with a key that this repository definition does not trust. Reinstall it:\n"
+		    "\n"
+		    "    SET allow_extension_repositories = 'allowed';\n"
+		    "    FORCE INSTALL %s FROM %s;\n"
+		    "\n"
+		    "If loading still fails the same way, refresh the repository's signing keys and reinstall:\n"
+		    "\n"
+		    "    CREATE OR REPLACE EXTENSION REPOSITORY %s WITH PREFIX '%s';\n"
+		    "    FORCE INSTALL %s FROM %s;\n"
+		    "\n"
+		    "Do not use -unsigned to work around this.%s",
+		    MovedPreamble(), EXTENSION_NAME, REPOSITORY_NAME, EXTENSION_NAME, REPOSITORY_NAME, REPOSITORY_NAME,
+		    REPOSITORY_URL, EXTENSION_NAME, REPOSITORY_NAME, MoreInformation());
 	}
-
-	QueryFarmSendTelemetry(loader, "minijinja", MINIJINJA_EXTENSION_VERSION);
 }
 
 void MinijinjaExtension::Load(ExtensionLoader &loader) {
-	LoadInternal(loader);
+	LoadFromQueryFarmOrExplain(loader.GetDatabaseInstance());
 }
+
 std::string MinijinjaExtension::Name() {
-	return "minijinja";
+	return EXTENSION_NAME;
 }
 
 std::string MinijinjaExtension::Version() const {
-	return MINIJINJA_EXTENSION_VERSION;
+	return EXTENSION_VERSION;
 }
 
 } // namespace duckdb
@@ -220,6 +167,6 @@ std::string MinijinjaExtension::Version() const {
 extern "C" {
 
 DUCKDB_CPP_EXTENSION_ENTRY(minijinja, loader) {
-	duckdb::LoadInternal(loader);
+	duckdb::LoadFromQueryFarmOrExplain(loader.GetDatabaseInstance());
 }
 }

@@ -4,12 +4,9 @@
 
 namespace duckdb {
 
-// Extension version - update this single location when releasing new versions
-#define MINIJINJA_EXTENSION_VERSION "2026102004"
-
 class MinijinjaExtension : public Extension {
 public:
-	void Load(ExtensionLoader &db) override;
+	void Load(ExtensionLoader &loader) override;
 	std::string Name() override;
 	std::string Version() const override;
 };
