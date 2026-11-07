@@ -1,0 +1,43 @@
+# name: test/sql/minijinja_security.test
+# description: template_path reads files through DuckDB's file system, so the
+#   sandbox settings apply.
+# group: [sql]
+
+require minijinja
+
+# Inline templates cannot reach the file system: includes only see the
+# template itself.
+statement error
+SELECT minijinja_render('{% include "/etc/passwd" %}')
+----
+TemplateNotFound
+
+statement ok
+SET enable_external_access = false
+
+# Inline templates keep working without external access.
+query T
+SELECT minijinja_render_with_context('Hello {{ name }}!', '{"name": "World"}')
+----
+Hello World!
+
+# template_path refuses when external access is disabled.
+statement error
+SELECT minijinja_render('index.html', template_path := './test/templates/')
+----
+Permission Error
+
+statement error
+SELECT minijinja_render_with_context('passwd', '{}', template_path := '/etc/')
+----
+Permission Error
+
+statement error
+SELECT minijinja_render_with_context('passwd', '{}', template_path := '/etc/passwd')
+----
+Permission Error
+
+statement error
+SELECT minijinja_render('x', template_path := '/etc/*')
+----
+Permission Error

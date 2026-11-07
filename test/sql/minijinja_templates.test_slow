@@ -1,0 +1,117 @@
+# name: test/sql/minijinja_templates.test_slow
+# description: Filesystem-backed templates (template_path). Requires host
+#   filesystem access, so it is excluded from the default suite (the wasm build
+#   has no host filesystem). Native CI still runs .test_slow.
+# group: [sql]
+
+require minijinja
+
+# A template directory: the template argument names a file within it.
+query T
+SELECT minijinja_render_with_context('index.html', '{"v": "B&O"}', autoescape := false, template_path := './test/templates/')
+----
+B&O
+
+# The trailing separator is optional.
+query T
+SELECT minijinja_render_with_context('index.html', '{"v": "B&O"}', autoescape := false, template_path := 'test/templates')
+----
+B&O
+
+# Templates are escaped by default, like inline templates.
+query T
+SELECT minijinja_render_with_context('index.html', '{"v": "B&O"}', template_path := 'test/templates')
+----
+B&amp;O
+
+# Template inheritance, includes from a subdirectory and macro imports work
+# across the loaded files.
+query T
+SELECT minijinja_render_with_context('page.html', '{"name": "Ada"}', template_path := 'test/templates')
+----
+<b>Hi Ada</b>
+
+query T
+SELECT minijinja_render_with_context('list.txt', '{"items": [1, 2, 3]}', template_path := 'test/templates')
+----
+[1][2][3]
+
+query T
+SELECT minijinja_render_with_context('imports.txt', '{"name": "hey"}', template_path := 'test/templates')
+----
+HEY!
+
+query T
+SELECT minijinja_render_with_context('partials/item.txt', '{"item": "x"}', template_path := 'test/templates')
+----
+[x]
+
+# A file path loads the templates next to it.
+query T
+SELECT minijinja_render_with_context('page.html', '{"name": "Ada"}', template_path := 'test/templates/layout.html')
+----
+<b>Hi Ada</b>
+
+# A glob loads the matching files, named relative to the glob's directory.
+query T
+SELECT minijinja_render_with_context('escape.txt', '{"v": "<i>"}', template_path := 'test/templates/*.txt')
+----
+&lt;i&gt;
+
+statement error
+SELECT minijinja_render_with_context('index.html', '{"v": 1}', template_path := 'test/templates/*.txt')
+----
+TemplateNotFound
+
+# The template name may vary per row.
+query T
+SELECT minijinja_render_with_context(name, '{"v": "<i>", "item": 1, "name": "Ada"}', template_path := 'test/templates')
+FROM (VALUES ('escape.txt'), ('partials/item.txt'), ('page.html'), (NULL)) t(name)
+----
+&lt;i&gt;
+[1]
+<b>Hi Ada</b>
+NULL
+
+# autoescape_extensions restricts escaping to templates with a matching suffix.
+query T
+SELECT minijinja_render_with_context(name, '{"v": "<i>"}', template_path := 'test/templates', autoescape_extensions := ['.html'])
+FROM (VALUES ('escape.html'), ('escape.txt')) t(name)
+----
+&lt;i&gt;
+<i>
+
+# Names cannot escape the template directory.
+statement error
+SELECT minijinja_render('../minijinja.test_slow', template_path := 'test/templates')
+----
+TemplateNotFound
+
+statement error
+SELECT minijinja_render('missing.html', template_path := 'test/templates')
+----
+Error { kind: TemplateNotFound, detail: "template \"missing.html\" does not exist" }
+
+# A template that includes itself hits MiniJinja's recursion limit instead of
+# overflowing the stack.
+statement error
+SELECT minijinja_render('self.txt', template_path := 'test/templates')
+----
+recursion limit
+
+# allowed_directories still permits template_path when external access is off.
+statement ok
+SET allowed_directories = ['test/templates/']
+
+statement ok
+SET enable_external_access = false
+
+query T
+SELECT minijinja_render_with_context('page.html', '{"name": "Ada"}', template_path := 'test/templates/')
+----
+<b>Hi Ada</b>
+
+statement error
+SELECT minijinja_render('index.html', template_path := 'test/sql/')
+----
+Permission Error

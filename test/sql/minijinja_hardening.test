@@ -1,0 +1,297 @@
+# name: test/sql/minijinja_hardening.test
+# description: Malformed input, limits and edge cases never crash DuckDB.
+# group: [sql]
+
+require minijinja
+
+require json
+
+# A NUL character in the context or the template used to abort the process
+# (CString::new panicked across the FFI). NUL characters are dropped from the output.
+query T
+SELECT minijinja_render_with_context('[{{ x }}]', '{"x": "a\u0000b"}')
+----
+[ab]
+
+query T
+SELECT minijinja_render_with_context('[{{ x }}]', '{"x": "\u0000"}')
+----
+[]
+
+query T
+SELECT length(minijinja_render(chr(0) || 'ab' || chr(0)))
+----
+2
+
+query T
+SELECT minijinja_render_with_context('{{ x }}', json_object('x', 'z' || chr(0)))
+----
+z
+
+# undefined_behavior: semi_strict used to behave like lenient.
+query T
+SELECT minijinja_render('[{% if missing %}x{% endif %}]', undefined_behavior := 'semi_strict')
+----
+[]
+
+statement error
+SELECT minijinja_render('[{{ missing }}]', undefined_behavior := 'semi_strict')
+----
+UndefinedError
+
+query T
+SELECT minijinja_render('[{{ missing }}]', undefined_behavior := 'lenient')
+----
+[]
+
+statement error
+SELECT minijinja_render('[{% if missing %}x{% endif %}]', undefined_behavior := 'strict')
+----
+UndefinedError
+
+# chainable allows attribute access on undefined values; lenient does not.
+query T
+SELECT minijinja_render('[{{ missing.a.b }}]', undefined_behavior := 'chainable')
+----
+[]
+
+statement error
+SELECT minijinja_render('[{{ missing.a.b }}]', undefined_behavior := 'lenient')
+----
+UndefinedError
+
+statement error
+SELECT minijinja_render('x', undefined_behavior := 'semistrict')
+----
+must be one of: lenient, strict, chainable, semi_strict
+
+statement error
+SELECT minijinja_render('x', undefined_behavior := '')
+----
+must be one of
+
+# Invalid JSON and JSON that is not an object are errors.
+statement error
+SELECT minijinja_render_with_context('{{ x }}', '{"x": ')
+----
+JSON
+
+statement error
+SELECT minijinja_render_with_context('{{ x }}', '[1, 2]')
+----
+the template context must be a JSON object
+
+statement error
+SELECT minijinja_render_with_context('{{ x }}', '42')
+----
+the template context must be a JSON object
+
+statement error
+SELECT minijinja_render_with_context('{{ x }}', 'null')
+----
+the template context must be a JSON object
+
+statement error
+SELECT minijinja_render_with_context('{{ x }}', '')
+----
+JSON
+
+# Deeply nested JSON is rejected by the JSON parser's depth limit, not by
+# overflowing the stack.
+statement error
+SELECT minijinja_render_with_context('{{ x }}', '{"x": ' || repeat('[', 100000) || repeat(']', 100000) || '}')
+----
+JSON
+
+# Template syntax errors are ordinary errors.
+statement error
+SELECT minijinja_render('{% if %}')
+----
+SyntaxError
+
+statement error
+SELECT minijinja_render('{{ x ')
+----
+SyntaxError
+
+statement error
+SELECT minijinja_render('{% for %}')
+----
+SyntaxError
+
+statement error
+SELECT minijinja_render('{% endif %}')
+----
+SyntaxError
+
+# Deeply nested templates hit MiniJinja's parser and runtime recursion limits.
+statement error
+SELECT minijinja_render('{{ ' || repeat('(', 1000) || '1' || repeat(')', 1000) || ' }}')
+----
+recursion limit
+
+statement error
+SELECT minijinja_render(repeat('{% if true %}', 20000) || 'x' || repeat('{% endif %}', 20000))
+----
+recursion limit
+
+statement error
+SELECT minijinja_render('{% macro f(n) %}{{ f(n + 1) }}{% endmacro %}{{ f(0) }}')
+----
+recursion limit
+
+statement error
+SELECT minijinja_render('x{% include "<string>" %}')
+----
+Error rendering template
+
+# Long operator chains are parsed into deep trees that would overflow the
+# stack; templates with more than 10000 operators in one tag are rejected.
+query T
+SELECT minijinja_render('{{ 1' || repeat(' + 1', 5000) || ' }}')
+----
+5001
+
+statement error
+SELECT minijinja_render('{{ 1' || repeat(' + 1', 50000) || ' }}')
+----
+is too complex: a tag contains more than 10000 operators
+
+statement error
+SELECT minijinja_render('{{ x' || repeat('.a', 200000) || ' }}')
+----
+is too complex
+
+statement error
+SELECT minijinja_render('{{ x' || repeat('|lower', 200000) || ' }}')
+----
+is too complex
+
+statement error
+SELECT minijinja_render('{% if ' || repeat('not ', 200000) || 'x %}{% endif %}')
+----
+is too complex
+
+# Operators inside string literals and comments do not count.
+query T
+SELECT length(minijinja_render('{# ' || repeat('+', 100000) || ' #}{{ "' || repeat('+', 100000) || '" }}'))
+----
+100000
+
+# Loops are bounded: range() is limited to 100000 items, and the fuel option
+# caps the instructions a single render may execute.
+statement error
+SELECT minijinja_render('{% for i in range(1000000000) %}{% endfor %}')
+----
+range has too many elements
+
+statement error
+SELECT minijinja_render('{% for i in range(100000) %}{% for j in range(100000) %}{% endfor %}{% endfor %}', fuel := 10000)
+----
+OutOfFuel
+
+query T
+SELECT minijinja_render('{% for i in range(10) %}{{ i }}{% endfor %}', fuel := 10000)
+----
+0123456789
+
+# Fuel is per render, not per query.
+query T
+SELECT count(*) FROM (SELECT minijinja_render_with_context('{% for i in range(n) %}{{ i }}{% endfor %}', json_object('n', 50), fuel := 1000) FROM range(500) t(n))
+----
+500
+
+statement error
+SELECT minijinja_render('x', fuel := -1)
+----
+No function matches
+
+# NULL handling across table columns, constant and non-constant templates.
+query II
+SELECT t, minijinja_render_with_context(t, c)
+FROM (VALUES ('{{ a }}', '{"a": 1}'), (NULL, '{"a": 2}'), ('{{ a }}', NULL), ('[{{ a }}]', '{"a": "ü"}'), ('', '{}')) v(t, c)
+----
+{{ a }}	1
+NULL	NULL
+{{ a }}	NULL
+[{{ a }}]	[ü]
+(empty)	(empty)
+
+query T
+SELECT minijinja_render_with_context('{{ n }}-{{ s }}', json_object('n', i, 's', i::VARCHAR || '!')) FROM range(3) t(i)
+----
+0-0!
+1-1!
+2-2!
+
+# Many distinct templates per thread (more than the per-thread cache holds).
+query I
+SELECT count(DISTINCT minijinja_render_with_context('{{ v }}' || i::VARCHAR, '{"v": "x"}')) FROM range(1000) t(i)
+----
+1000
+
+# A syntax error in one row's template is reported even when other rows are fine.
+statement error
+SELECT minijinja_render(t) FROM (VALUES ('ok'), ('{{ broken')) v(t)
+----
+SyntaxError
+
+# Unicode
+query T
+SELECT minijinja_render_with_context('{{ s | upper }} {{ s | length }}', '{"s": "héllo wörld 🦆"}')
+----
+HÉLLO WÖRLD 🦆 13
+
+# A STRUCT (for example a whole row) can be used as the context: it is cast to JSON.
+query T
+SELECT minijinja_render_with_context('{{ name }} is {{ age }}', {'name': 'Ada', 'age': 36})
+----
+Ada is 36
+
+query T
+SELECT minijinja_render_with_context('{{ name }}: {{ tags | join(",") }}', t) FROM (VALUES ('Ada', ['x', 'y'])) t(name, tags)
+----
+Ada: x,y
+
+# Filters: tojson and urlencode (now enabled) and minijinja-contrib extras.
+query T
+SELECT minijinja_render_with_context('{{ v | tojson }}', '{"v": {"a": [1, "b"]}}', autoescape := false)
+----
+{"a":[1,"b"]}
+
+query T
+SELECT minijinja_render_with_context('{{ v | urlencode }}', '{"v": "a b&c"}')
+----
+a%20b%26c
+
+query T
+SELECT minijinja_render('{{ "hello world".title() }} {{ "a,b".split(",") | length }} {{ "  x ".strip() }}')
+----
+Hello World 2 x
+
+query T
+SELECT minijinja_render_with_context('{% for k, v in d.items() %}{{ k }}={{ v }};{% endfor %}', '{"d": {"a": 1, "b": 2}}')
+----
+a=1;b=2;
+
+query T
+SELECT minijinja_render('{{ 3 | pluralize("y", "ies") }} {{ 1500 | filesizeformat }} {{ "<b>x</b>" | striptags }}')
+----
+ies 1.5 kB x
+
+query T
+SELECT minijinja_render('{{ "a very long sentence here" | truncate(length=10) }}')
+----
+a very...
+
+query T
+SELECT minijinja_render('{% for i in range(3) %}{% break %}{% endfor %}done')
+----
+done
+
+# Rendering is deterministic, so the function is not volatile (constant
+# arguments can be folded).
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'minijinja%' AND stability <> 'CONSISTENT'
+----
+0

@@ -7,11 +7,71 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/**
+ * How undefined variables are treated. The caller validates the user's choice; unknown codes are errors.
+ */
+#define UNDEFINED_LENIENT 0
+#define UNDEFINED_STRICT 1
+#define UNDEFINED_SEMI_STRICT 2
+#define UNDEFINED_CHAINABLE 3
+
 extern "C" {
-typedef enum ResultCString_Tag {
-	Ok,
-	Err,
-} ResultCString_Tag;
+
+/**
+ * A configured environment holding parsed templates; it can render any number of times.
+ *
+ * For an inline template it holds that single template; for `template_path` it holds a loader over
+ * the templates the caller read, and the template to render is chosen by name for each call.
+ */
+typedef struct CompiledEnvironment CompiledEnvironment;
+
+struct CompileResult {
+	enum class Tag {
+		Ok,
+		Err,
+	};
+
+	struct Ok_Body {
+		CompiledEnvironment *_0;
+	};
+
+	struct Err_Body {
+		char *_0;
+	};
+
+	Tag tag;
+	union {
+		Ok_Body ok;
+		Err_Body err;
+	};
+};
+
+/**
+ * A template loaded by the caller (for `template_path`): its name and its source text.
+ */
+typedef struct TemplateSource {
+	const char *name;
+	uintptr_t name_len;
+	const char *source;
+	uintptr_t source_len;
+} TemplateSource;
+
+/**
+ * The options an environment is built with.
+ */
+typedef struct EnvironmentOptions {
+	bool autoescape;
+	uint8_t undefined_behavior;
+	/**
+	 * File name suffixes that switch on HTML escaping (when non-empty, only matching templates are escaped)
+	 */
+	const char *const *autoescape_on;
+	uintptr_t autoescape_on_count;
+	/**
+	 * The maximum number of instructions a single render may execute; 0 means unlimited
+	 */
+	uint64_t fuel;
+} EnvironmentOptions;
 
 struct ResultCString {
 	enum class Tag {
@@ -35,33 +95,26 @@ struct ResultCString {
 };
 
 /**
- * Renders a Minijinja template from a file or a string with context variables provided as JSON.
+ * Builds an environment for rendering.
  *
- * # Arguments
- * * `template_source` - Either the filename of the template or the template content as a string.
- * * `from_file` - If true, treat `template_source` as a filename, otherwise as template content.
- * * `json_context` - JSON string containing context variables.
- *
- * # Returns
- * * `Ok(String)` containing the rendered template, or `Err(minijinja::Error)` if rendering fails.
+ * Without `use_templates` the environment holds the single inline template `source` (parsed now, so
+ * syntax errors are reported here). With it, the environment serves the given templates (possibly none)
+ * by name and `source` is ignored. Free the result with `free_compiled_environment` / `free_compile_error`.
  */
-struct ResultCString render_template(const char *template_source, uintptr_t template_source_len,
-                                     const char *json_context, uintptr_t json_context_len, const char *template_path,
-                                     bool autoscape, const char *undefined_behavior, const char **autoescape_on,
-                                     size_t autoescape_on_count);
+struct CompileResult compile_environment(const char *source, uintptr_t source_len, bool use_templates,
+                                         const struct TemplateSource *templates, uintptr_t templates_count,
+                                         const struct EnvironmentOptions *options);
 
 /**
- * Frees the memory allocated for a ResultCString.
- *
- * # Arguments
- * * `result` - The ResultCString to free
- *
- * # Safety
- * This function is unsafe because it takes ownership of raw pointers.
- * The caller must ensure that:
- * - The ResultCString was created by this library
- * - The ResultCString is not used after calling this function
- * - This function is called exactly once for each ResultCString
+ * Renders a template of a compiled environment with a JSON object as context. For an inline
+ * environment `name` is ignored; otherwise it is the name of the template to render.
  */
+struct ResultCString render_compiled(const CompiledEnvironment *compiled, const char *name, uintptr_t name_len,
+                                     const char *json_context, uintptr_t json_context_len);
+
+void free_compiled_environment(CompiledEnvironment *compiled);
+
+void free_compile_error(char *msg);
+
 void free_result_cstring(struct ResultCString result);
 }

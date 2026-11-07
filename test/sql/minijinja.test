@@ -60,8 +60,8 @@ FROM duckdb_functions()
 WHERE function_name LIKE 'minijinja_render%'
 ORDER BY function_name
 ----
-minijinja_render	[template, autoescape, template_path, undefined_behavior, autoescape_extensions]	[VARCHAR, BOOLEAN, VARCHAR, VARCHAR, 'VARCHAR[]']
-minijinja_render_with_context	[template, context, autoescape, template_path, undefined_behavior, autoescape_extensions]	[VARCHAR, JSON, BOOLEAN, VARCHAR, VARCHAR, 'VARCHAR[]']
+minijinja_render	[template, autoescape, template_path, undefined_behavior, autoescape_extensions, fuel]	[VARCHAR, BOOLEAN, VARCHAR, VARCHAR, 'VARCHAR[]', UBIGINT]
+minijinja_render_with_context	[template, context, autoescape, template_path, undefined_behavior, autoescape_extensions, fuel]	[VARCHAR, JSON, BOOLEAN, VARCHAR, VARCHAR, 'VARCHAR[]', UBIGINT]
 
 query II
 SELECT description IS NOT NULL, categories
@@ -72,6 +72,43 @@ ORDER BY function_name
 true	[text, template]
 true	[text, template]
 
+# Every function has a description, examples, categories and real parameter names.
+query I
+SELECT count(*)
+FROM duckdb_functions()
+WHERE function_name LIKE 'minijinja%'
+  AND (description IS NULL OR description = '' OR examples IS NULL OR len(examples) = 0
+       OR categories IS NULL OR len(categories) = 0
+       OR list_contains(parameters, 'col0') OR len(parameters) <> len(parameter_types))
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'minijinja%'
+----
+2
+
+# The documented examples run.
+query T
+SELECT minijinja_render('Hello World!')
+----
+Hello World!
+
+query T
+SELECT minijinja_render('{% for i in range(3) %}{{ i }}{% endfor %}')
+----
+012
+
+query T
+SELECT minijinja_render_with_context('{{ items | join(", ") }}', '{"items": [1, 2, 3]}')
+----
+1, 2, 3
+
+query T
+SELECT minijinja_render_with_context('{{ name | title }}', '{"name": "ada lovelace"}', undefined_behavior := 'strict')
+----
+Ada Lovelace
+
 # The positional arguments can also be passed by name, in any order.
 query T
 SELECT minijinja_render_with_context(context := '{"a": 1}', template := '{{ a }}')
@@ -80,7 +117,7 @@ SELECT minijinja_render_with_context(context := '{"a": 1}', template := '{{ a }}
 
 # Explicitly passing the defaults matches the default behavior.
 query T
-SELECT minijinja_render_with_context('{{ v }}', '{"v": "B&O"}', autoescape := true, template_path := '', undefined_behavior := 'lenient', autoescape_extensions := [])
+SELECT minijinja_render_with_context('{{ v }}', '{"v": "B&O"}', autoescape := true, template_path := '', undefined_behavior := 'lenient', autoescape_extensions := [], fuel := 0)
 ----
 B&amp;O
 
